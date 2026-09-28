@@ -1,0 +1,13 @@
+{
+  "name": "TCS & PROG SPI",
+  "version": "1.0.4",
+  "apiVersion": "1.0.0",
+  "author": "cnbright",
+  "description": "ICNT9268S TCS/PROG decoder with CRC validation, response correlation and Die selection",
+  "extensions": {
+    "TCS & PROG": {
+      "type": "HighLevelAnalyzer",
+      "entryPoint": "HighLevelAnalyzer.Hla"
+    }
+  }
+}
