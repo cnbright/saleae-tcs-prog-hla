@@ -1,6 +1,6 @@
 """ICNT9268S SPI protocol; independent of the Saleae runtime.
 
-Byte offsets and CRC rules are sourced in README.md. No damaged bytes are repaired.
+Byte offsets and CRC rules are described in docs/PROTOCOL.md. No damaged bytes are repaired.
 """
 from dataclasses import dataclass, field
 from command_names import COMMAND_NAMES
@@ -19,6 +19,11 @@ def hexstr(data):
     return data.hex(' ').upper() if data is not None else '(not captured)'
 
 
+def tcs_command_id(command):
+    """Decimal class:command; class occupies bits 8..12, without RW flags."""
+    return '{}:{:02d}'.format((command >> 8) & 0x1F, command & 0xFF)
+
+
 SPECIALS = {
     b'\xcc\x33\x55\x5a': 'ENTER_PROG',
     b'\x81': 'DIE_DIGITAL',
@@ -32,6 +37,10 @@ SPECIAL_LABELS = {
     'DIE_ANALOG': 'Switch to analog DIE (0x82)',
     'DIE_EXTENDED': 'Switch to extended DIE (0x83)',
 }
+
+# The firmware preloads a 57-byte compressed coordinate report for 0x5105.
+# Hosts may still clock the uncompressed report size; unused RX clocks are 7F.
+COMPRESSED_COORDINATE_LENGTH = 57
 
 
 def direction_score(data):
@@ -65,14 +74,18 @@ class Packet:
         self.data['warnings'] = '; '.join(self.warnings)
         payload = self.data.get('payload', '')
         self.data['payload_preview'] = payload if len(payload) <= 95 else payload[:95] + ' ...'
-        cmd = self.data.get('command', '????').removeprefix('0x')
+        cmd = self.data.get('command_id', '??:??')
         rw = self.data.get('rw', '').lower()
         count = self.data.get('length', '?')
         preview = self.data['payload_preview']
         if self.kind in ('TCS_REQUEST', 'TCS_INLINE'):
-            text = 'TCS Request CMD={} {} {} bytes'.format(cmd, rw, count)
+            count = self.data.get('requested_length', count)
+            text = 'TCS Request CMDID={} {} {} bytes'.format(cmd, rw, count)
             if self.kind == 'TCS_INLINE':
-                text += ' / TCS Replay data = ' + preview
+                replay = 'TCS Replay'
+                if self.data.get('length') != count:
+                    replay += ' {} bytes'.format(self.data['length'])
+                text += ' / ' + replay + ' data = ' + preview
             elif payload:
                 text += ' data = ' + preview
         elif self.kind == 'TCS_RESPONSE':
@@ -171,17 +184,20 @@ class Decoder:
         cmd = int.from_bytes(tx[1:3], 'little')
         n = int.from_bytes(tx[3:5], 'little')
         key = cmd & 0x1FFF
-        p.data.update(command='0x{:04X}'.format(cmd), cmd_id='0x{:02X}'.format(tx[1]),
+        p.data.update(command='0x{:04X}'.format(cmd), command_id=tcs_command_id(cmd),
+                      cmd_id='0x{:02X}'.format(tx[1]),
                       class_id='0x{:02X}'.format(tx[2]), logical_class='0x{:02X}'.format(tx[2] & 31),
                       read_flag=(tx[2] >> 6) & 1, write_flag=(tx[2] >> 5) & 1, length=n,
                       command_name=COMMAND_NAMES.get(key, 'Unknown/reserved'))
         p.add(0, 1, 'RW', p.data['rw'])
-        p.add(1, 3, 'CMD', p.data['command'] + ' ' + p.data['command_name'])
+        p.add(1, 3, 'CMDID', p.data['command_id'] + ' ' + p.data['command_name'])
         p.add(3, 5, 'LEN', n)
         self._crc(p, 'header_crc', tx, 5, tx[:5], 'little')
         if tx[2] & 0xE0 != (0x40 if read else 0x20):
             p.errors.append('RW_FLAG_MISMATCH')
-        inline = read and key == 0x1106
+        # Keep header-only coordinate reads compatible with split-CS replies.
+        # Interrupt coordinate reads, like polling reads, return from RX byte 0.
+        inline = read and (key == 0x1106 or (key == 0x1105 and len(tx) > 7))
         expected = n + 5 if inline else 7 if read else n + 9
         p.data['expected_transaction_length'] = expected
         if len(tx) != expected:
@@ -196,13 +212,25 @@ class Decoder:
         if inline:
             p.kind = 'TCS_INLINE'
             p.data['inline'] = True
-            self._response(p, rx, req)
+            response_length = None
+            short_end = COMPRESSED_COORDINATE_LENGTH + 5
+            if (key == 0x1105 and n > COMPRESSED_COORDINATE_LENGTH
+                    and rx is not None and len(rx) > short_end
+                    and all(byte == 0x7F for byte in rx[short_end:])):
+                # Use the firmware's fixed boundary, never rstrip or search for
+                # an embedded echo/CRC. Validate the complete short trailer below.
+                response_length = COMPRESSED_COORDINATE_LENGTH
+                p.data.update(response_padding=hexstr(rx[short_end:]),
+                              response_padding_length=len(rx) - short_end)
+                rx = rx[:short_end]
+            self._response(p, rx, req, response_length)
         else:
             self.pending = req
 
-    def _response(self, p, rx, req):
+    def _response(self, p, rx, req, response_length=None):
         if req:
             p.data.update(request_transaction=req['transaction'], command='0x{:04X}'.format(req['cmd']),
+                          command_id=tcs_command_id(req['cmd']),
                           command_name=COMMAND_NAMES.get(req['cmd'] & 0x1FFF, 'Unknown/reserved'),
                           rw='READ' if req['read'] else 'WRITE', requested_length=req['length'],
                           cmd_id='0x{:02X}'.format(req['cmd'] & 255),
@@ -218,13 +246,16 @@ class Decoder:
         n = len(rx) - 5
         echo = int.from_bytes(rx[-4:-2], 'little')
         p.data.update(length=n, payload=hexstr(rx[:n]), err_code='0x{:02X}'.format(rx[-5]),
-                      echo_command='0x{:04X}'.format(echo), echo_matches=bool(req and echo == req['cmd']))
+                      echo_command='0x{:04X}'.format(echo), echo_command_id=tcs_command_id(echo),
+                      echo_matches=bool(req and echo == req['cmd']))
         p.add(0, n, 'DATA', hexstr(rx[:n]))
         p.add(n, n + 1, 'ErrCode', p.data['err_code'])
-        p.add(n + 1, n + 3, 'ECHO_CMD', p.data['echo_command'])
+        p.add(n + 1, n + 3, 'ECHO_CMD', p.data['echo_command_id'])
         self._crc(p, 'response_crc', rx, len(rx) - 2, rx[:-2], 'little')
         if req:
             expected = req['length'] if req['read'] else 0
+            if response_length is not None:
+                expected = response_length
             if n != expected:
                 p.errors.append('RESPONSE_LENGTH_MISMATCH:{}!={}'.format(n, expected))
             if echo != req['cmd']:

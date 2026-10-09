@@ -7,10 +7,11 @@
 ## 显示效果
 
 ```text
-TCS Request CMD=5003 read 4 bytes
+TCS Request CMDID=16:03 read 4 bytes
 TCS Replay data = DB 92 00 00
-TCS Request CMD=3109 write 1 bytes data = 00
+TCS Request CMDID=17:09 write 1 bytes data = 00
 TCS Replay ACK
+TCS Request CMDID=17:05 read 112 bytes / TCS Replay 57 bytes data = 00 51 00 03 ...
 PROG read 0x070010 4 bytes = 02 02 00 00
 PROG write 0x070008 1 bytes = FE
 Switch to extended DIE (0x83)
@@ -44,7 +45,7 @@ Switch to extended DIE (0x83)
 | Host request line | Auto / MOSI / MISO | Auto 根据有效请求头 CRC 或完整特殊序列锁定主机请求方向；接线反置时可指定 MISO |
 | Display | Transactions / Fields | 每个 CS 显示一条摘要，或按字段时间显示 |
 
-Auto 锁定后不会随返回数据切换方向。从应答中间开始采样、两条线同时出现候选请求时，请手动选择方向。同 CS 的 TCS 轮询存在双向数据重叠，即使选择 Fields，也会使用一条完整事务摘要。
+Auto 锁定后不会随返回数据切换方向。从应答中间开始采样、两条线同时出现候选请求时，请手动选择方向。同 CS 的 TCS 触点帧和轮询存在双向数据重叠，即使选择 Fields，也会使用一条完整事务摘要。`0x5105` 压缩触点帧实际数据可为 57 字节；请求长度和返回数据长度分别显示，尾部 `0x7F` 填充不进入 payload。
 
 ## 表格列
 
@@ -52,11 +53,11 @@ Auto 锁定后不会随返回数据切换方向。从应答中间开始采样、
 |---|---|
 | Type | TCS Request、TCS Replay、PROG、Special |
 | transaction | 十进制事务编号，从 1 开始 |
-| CMDID | 合并后的 TCS 命令 ID（如 `0x5003`）或完整 PROG 地址（如 `0x070010`） |
+| CMDID | TCS 十进制 `类号:命令号`（如 `16:03`、`17:05`，去除读写位）或完整 PROG 地址（如 `0x070010`） |
 | rw | READ / WRITE |
 | payload | 有效 DATA，十六进制字节 |
 | request_transaction | TCS 应答关联的请求编号，十进制 |
-| echo_command | 芯片实际回显的合并 TCS 命令 ID |
+| echo_command | 芯片实际回显的 TCS 命令，按相同的 `类号:命令号` 格式显示 |
 | special | 进入 PROG、Die 切换等特殊操作 |
 | summary | 与波形一致的简洁说明 |
 
@@ -77,7 +78,7 @@ Fields 模式还会提供 `field` / `value`。Type 中的 TCS Request 包括同 
 
 - TCS：请求头 CRC、写数据 CRC、应答 CRC、长度、读写标志、ErrCode 与命令回显。
 - PROG：请求头 CRC、数据 CRC、长度与尾部 ACK。
-- 支持普通分离式 TCS 请求/应答和 `F1 06 51` 同 CS 轮询。
+- 支持普通分离式 TCS 请求/应答、`F1 05 51` 同 CS 触点帧和 `F1 06 51` 同 CS 轮询。
 - 原始数据不修补：错误 CRC、全零 ACK、丢失应答会保留为异常。
 - 需要完整 CS 边界；片选开始前的字节被忽略，缺少结束边界的最后一笔不输出。
 - 每个 CS 最多缓冲 1 MiB，超过上限明确报错；不接受 16/32 位 SPI 传输设置。
@@ -98,7 +99,7 @@ python tools/build_release.py
 python replay.py capture.csv --direction Auto --output decoded.json
 ```
 
-CSV 需要包含 `type`、`start_time`、`duration`、`mosi`、`miso` 列。也支持逐事务 JSON，包含 `start_s`、`end_s`、`mosi`、`miso` 字段。`.kvdat` 不属于该命令的直接输入格式。
+CSV 需要包含 `type`、`start_time`、`duration`、`mosi`、`miso` 列。同时导出 SPI 和本插件时，会跳过 `name` 为 `TCS & PROG` 的已有结果行。也支持逐事务 JSON，包含 `start_s`、`end_s`、`mosi`、`miso` 字段。`.kvdat` 不属于该命令的直接输入格式。
 
 如已持有原始参考数据目录，可执行可选的完整回归：
 
@@ -106,7 +107,7 @@ CSV 需要包含 `type`、`start_time`、`duration`、`mosi`、`miso` 列。也�
 python -m tests.validate_reference --reference /path/to/reference
 ```
 
-原始参考数据不随仓库分发。当前测试覆盖 21 项单元测试、56 项参考断言和 2,610 笔参考事务，详见 [测试摘要](docs/TEST_REPORT.md)。回归通过表示解析与预期一致，不表示所有输入通信数据都有效。
+原始参考数据不随仓库分发。当前测试覆盖 31 项单元测试、56 项参考断言和 2,610 笔参考事务，另已回放验证 34 笔触点帧，详见 [测试摘要](docs/TEST_REPORT.md)。回归通过表示解析与预期一致，不表示所有输入通信数据都有效。
 
 ## 项目结构
 
