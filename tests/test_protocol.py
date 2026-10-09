@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 import random
 import unittest
-from protocol import Decoder, crc16
+from protocol import Decoder, crc16, tcs_command_id
 from tests.saleae_stub import Frame, load_hla
 
 
@@ -17,6 +17,12 @@ def request(cmd=0x5003, n=4, payload=None):
 def response(cmd=0x5003, payload=b'\xdb\x92\x00\x00', err=0):
     data = payload + bytes([err]) + cmd.to_bytes(2, 'little')
     return data + crc16(data).to_bytes(2, 'little')
+
+
+def coordinates(payload=bytes(57), n=112):
+    rx = response(0x5105, payload)
+    tx = request(0x5105, n) + bytes(n - 7) + b'\x7f' * 5
+    return tx, rx + b'\x7f' * (len(tx) - len(rx))
 
 
 def prog(payload=b'\x02\x02\x00\x00', read=True, address=0x070010):
@@ -45,6 +51,34 @@ def feed(hla, tx, rx=None, swap=False):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_command_id_class_and_command_are_decimal(self):
+        for raw, expected in ((0x5105, '17:05'), (0x3105, '17:05'),
+                              (0x5003, '16:03'), (0x510A, '17:10'),
+                              (0x311A, '17:26'), (0x5FFF, '31:255')):
+            with self.subTest(raw=raw):
+                self.assertEqual(tcs_command_id(raw), expected)
+
+    def test_command_id_display_preserves_wire_validation(self):
+        for cmd, payload in ((0x5107, None), (0x3107, b'\x01')):
+            with self.subTest(cmd=cmd):
+                d = Decoder()
+                p = d.decode(request(cmd, 1, payload))
+                self.assertEqual(p.data['status'], 'OK')
+                self.assertEqual(p.data['command_id'], '17:07')
+                self.assertEqual(p.data['command'], '0x{:04X}'.format(cmd))
+                self.assertIn('CMDID=17:07', p.data['summary'])
+                reply_payload = b'\x01' if payload is None else b''
+                rx = response(cmd, reply_payload)
+                p = d.decode(b'\xff' * len(rx), rx)
+                self.assertEqual(p.data['status'], 'OK')
+                self.assertEqual(p.data['command_id'], '17:07')
+                self.assertEqual(p.data['echo_command_id'], '17:07')
+        d = Decoder(); d.decode(request(0x5107, 1))
+        p = d.decode(b'\xff' * 6, response(0x3107, b'\x01'))
+        self.assertEqual(p.data['command_id'], p.data['echo_command_id'])
+        self.assertIn('ECHO_MISMATCH', p.errors)
+        self.assertEqual(p.data['response_crc_status'], 'OK')
+
     def test_known_crc_vectors(self):
         # CRC-16/BUYPASS check value, plus captured TCS and PROG headers.
         self.assertEqual(crc16(b'123456789'), 0xFEE8)
@@ -82,6 +116,73 @@ class ProtocolTests(unittest.TestCase):
         p = Decoder().decode(tx, rx)
         self.assertEqual(p.kind, 'TCS_INLINE')
         self.assertFalse(p.errors)
+
+    def test_inline_compressed_coordinates(self):
+        # Captured empty report: 57 data bytes, 00 05 51 E5 9F, then 55 x 7F.
+        tx, rx = coordinates()
+        self.assertEqual(tx[:7], bytes.fromhex('f1 05 51 70 00 aa 4a'))
+        self.assertEqual(rx[57:62], bytes.fromhex('00 05 51 e5 9f'))
+        d = Decoder()
+        for i in range(1, 4):
+            p = d.decode(tx, rx)
+            self.assertEqual(p.kind, 'TCS_INLINE')
+            self.assertEqual(p.data['status'], 'OK')
+            self.assertEqual(p.data['requested_length'], 112)
+            self.assertEqual(p.data['length'], 57)
+            self.assertEqual(p.data['payload'], ' '.join(['00'] * 57))
+            self.assertEqual(p.data['response_padding_length'], 55)
+            self.assertEqual(p.data['response_crc_status'], 'OK')
+            self.assertEqual(p.data['request_transaction'], i)
+            self.assertIsNone(d.pending)
+            self.assertFalse(p.warnings)
+            self.assertIn('read 112 bytes / TCS Replay 57 bytes', p.data['summary'])
+        self.assertEqual(d.decode(request()).data['status'], 'OK')
+
+    def test_coordinates_full_and_split_responses(self):
+        # Payload may contain 7F bytes and a command echo inside the data.
+        for n in (57, 112, 128):
+            payload = b'\x7f' * 57 + b'\x00\x05\x51' + b'\x7f' * n
+            payload = payload[:n]
+            p = Decoder().decode(*coordinates(payload, n))
+            self.assertEqual(p.data['status'], 'OK')
+            self.assertEqual(p.data['payload'], payload.hex(' ').upper())
+            self.assertNotIn('response_padding_length', p.data)
+        d = Decoder()
+        self.assertEqual(d.decode(request(0x5105, 57)).kind, 'TCS_REQUEST')
+        p = d.decode(b'\xff' * 62, response(0x5105, bytes(57)))
+        self.assertEqual(p.data['status'], 'OK')
+        self.assertEqual(p.data['request_transaction'], 1)
+
+    def test_coordinates_corruption_is_not_hidden(self):
+        tx, rx = coordinates()
+        for index, error in ((0, 'RESPONSE_CRC_BAD'), (60, 'RESPONSE_CRC_BAD'),
+                             (58, 'ECHO_MISMATCH'), (57, 'DEVICE_ERRCODE'),
+                             (62, 'RESPONSE_CRC_BAD')):
+            with self.subTest(index=index):
+                bad = bytearray(rx); bad[index] ^= 1
+                self.assertIn(error, Decoder().decode(tx, bytes(bad)).errors)
+        bad = bytearray(tx); bad[5] ^= 1
+        p = Decoder().decode(bytes(bad), rx)
+        self.assertIn('HEADER_CRC_BAD', p.errors)
+        self.assertIn('REQUEST_INVALID', p.errors)
+        self.assertIn('RESPONSE_MISSING_OR_TRUNCATED', Decoder().decode(tx).errors)
+        self.assertIn('RX_LENGTH_MISMATCH', Decoder().decode(tx, rx[:-1]).errors)
+        self.assertTrue(Decoder().decode(tx, bytes(len(tx))).errors)
+
+    def test_short_coordinate_rule_does_not_apply_to_other_commands(self):
+        _, rx = coordinates()
+        for cmd in (0x5106, 0x5003):
+            tx = request(cmd, 112) + bytes(110)
+            p = Decoder().decode(tx, rx)
+            self.assertTrue(p.errors)
+            self.assertNotIn('response_padding_length', p.data)
+        tx, rx = coordinates()
+        for i in range(len(tx)):
+            if i == 7:
+                # A complete header alone is also a valid split-CS request.
+                continue
+            with self.subTest(length=i):
+                self.assertTrue(Decoder().decode(tx[:i], rx[:i]).errors)
 
     def test_prog_read_and_write(self):
         for read in (True, False):
@@ -143,6 +244,48 @@ class ProtocolTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_command_id_in_requests_responses_and_fields(self):
+        for display in ('Transactions', 'Fields'):
+            for cmd, expected, payload in ((0x510A, '17:10', None),
+                                           (0x310A, '17:10', b'\x01')):
+                with self.subTest(display=display, cmd=cmd):
+                    h = load_hla(display=display)
+                    out = feed(h, request(cmd, 1, payload))
+                    self.assertTrue(all(r.data['CMDID'] == expected for r in out))
+                    if display == 'Fields':
+                        field = next(r for r in out if r.data['field'] == 'CMDID')
+                        self.assertEqual(field.data['value'], expected)
+                        self.assertEqual(field.data['summary'], 'CMDID=' + expected)
+                    else:
+                        self.assertIn('CMDID=' + expected, out[0].data['summary'])
+                    rx = response(cmd, b'\x01' if payload is None else b'')
+                    out = feed(h, b'\xff' * len(rx), rx)
+                    self.assertTrue(all(r.data['CMDID'] == expected for r in out))
+                    self.assertTrue(all(r.data['echo_command'] == expected for r in out))
+                    if display == 'Fields':
+                        field = next(r for r in out if r.data['field'] == 'ECHO_CMD')
+                        self.assertEqual(field.data['value'], expected)
+        out = feed(load_hla(), *prog())
+        self.assertEqual(out[0].data['CMDID'], '0x070010')
+
+    def test_coordinates_both_directions_and_displays(self):
+        tx, rx = coordinates()
+        for swap in (False, True):
+            for display in ('Transactions', 'Fields'):
+                with self.subTest(swap=swap, display=display):
+                    h = load_hla(display=display)
+                    for i in range(1, 3):
+                        out = feed(h, tx, rx, swap)
+                        self.assertEqual(len(out), 1)
+                        self.assertEqual(out[0].type, 'TCS Request')
+                        self.assertEqual(out[0].data['transaction'], str(i))
+                        self.assertEqual(out[0].data['CMDID'], '17:05')
+                        self.assertEqual(out[0].data['echo_command'], '17:05')
+                        self.assertEqual(out[0].data['payload'], ' '.join(['00'] * 57))
+                        self.assertNotIn('[error]', out[0].data['summary'])
+                        self.assertNotIn('[warning]', out[0].data['summary'])
+                    self.assertEqual(h.locked_direction, 'miso' if swap else 'mosi')
+
     def test_auto_both_directions(self):
         for swap in (True, False):
             h = load_hla()

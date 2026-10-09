@@ -11,7 +11,21 @@
 写应答: ErrCode CMD_L CMD_H CRC_L CRC_H
 ```
 
-CMD 和 LEN 均为小端。CMD_H 的 bit6 表示读，bit5 表示写，低 5 位为逻辑类号。普通应答发生在下一次 CS 事务，主机发送全 FF 占位；`F1 06 51` 轮询在同一次 CS 内从返回通道第 0 字节接收完整数据帧。
+CMD 和 LEN 均为小端。CMD_H 的 bit6 表示读，bit5 表示写，低 5 位为逻辑类号。普通应答发生在下一次 CS 事务，主机发送全 FF 占位；`F1 05 51` 中断触点读取和 `F1 06 51` 轮询可在同一次 CS 内从返回通道第 0 字节接收完整数据帧。完整的 7 字节 `0x5105` 请求仍可关联下一次 CS 的普通应答。
+
+界面 CMDID 按十进制 `类号:命令号` 显示：类号为 `CMD_H & 0x1F`，命令号为 CMD_L，命令号至少两位。例如 `05 51` → `17:05`（READ），`05 31` → `17:05`（WRITE），`0A 51` → `17:10`。摘要、字段和回显列使用同一格式。离线诊断的 `command` / `echo_command` 保留原始命令字，`command_id` / `echo_command_id` 提供显示值；CRC 和完整回显校验仍使用原始字节。
+
+### 压缩触点帧（0x5105）
+
+芯片可预装 57 字节压缩触点数据，主机仍按 112 字节数据长度提供时钟，总事务 117 字节。此时返回布局为：
+
+```text
+DATA[57] ErrCode 05 51 CRC_L CRC_H 7F[55]
+```
+
+解析使用固定的 57 字节数据边界，仅在请求长度大于 57、应答尾部之后全部为 `0x7F` 时识别这一格式。CRC 覆盖前 60 字节；后续填充单独记录在离线诊断的 `response_padding` / `response_padding_length` 中，不进入 payload 或 CRC。`requested_length` 保留请求的 112 字节，`length` 表示实际 57 字节数据。不会按 `0x7F` 去尾，也不会搜索数据中的命令或 CRC 来移动边界。其他命令和完整长度的 `0x5105` 返回继续按常规长度校验。
+
+此格式由参考固件 `SpiComm.c` 的 `ReFillCaptureDataTxDmaAddr()` 确认：压缩手指/触控笔协议设置 `SendBytes = 57` 并添加 3 字节 ErrCode/CMD 后缀；`SpiSlave.c` 的 `SpiDma_WrBytSet()` 为 DATA 和后缀配置硬件 CRC。用户提供的 34 笔采样均在相同边界通过请求头 CRC、返回 CRC、ErrCode 和命令回显校验，且后续各有 55 字节 `0x7F`。
 
 CRC：poly=`0x8005`，init=`0`，xorout=`0`，不反射、MSB 递推，线上小端。
 

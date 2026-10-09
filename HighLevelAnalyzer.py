@@ -11,11 +11,13 @@ def display_type(packet):
 def display_data(packet):
     """Only user-facing fields go to Logic; diagnostics stay in the decoder."""
     keys = ('summary', 'transaction', 'rw', 'payload',
-            'request_transaction', 'echo_command', 'special')
+            'request_transaction', 'special')
     visible = {key: packet.data[key] for key in keys if key in packet.data}
-    identity = packet.data.get('address' if packet.kind == 'PROG' else 'command')
+    identity = packet.data.get('address' if packet.kind == 'PROG' else 'command_id')
     if identity is not None:
         visible['CMDID'] = identity
+    if 'echo_command_id' in packet.data:
+        visible['echo_command'] = packet.data['echo_command_id']
     # Text is independent of Logic's global number radix (often hexadecimal).
     for key in ('transaction', 'request_transaction'):
         if key in visible:
@@ -117,8 +119,8 @@ class Hla(HighLevelAnalyzer):
             for first, stop, name, value in sorted(packet.fields):
                 if name in ('LEN', 'ErrCode') or 'CRC' in name:
                     continue
-                if name == 'CMD':
-                    value = packet.data['command'].removeprefix('0x')
+                if name == 'CMDID':
+                    value = packet.data['command_id']
                 if 0 <= first < stop <= len(words):
                     details = dict(visible, field=name, value=value, summary=name + '=' + value)
                     result.append(AnalyzerFrame(display_type(packet), words[first].start_time, words[stop - 1].end_time, details))
@@ -126,5 +128,5 @@ class Hla(HighLevelAnalyzer):
                 details = dict(visible, summary='Invalid transaction' if packet.errors else 'Unverified transaction')
                 result.append(AnalyzerFrame(display_type(packet), frame.start_time, frame.end_time, details))
             return result or None
-        # Inline polling is full duplex: use one row to avoid overlapping time bubbles.
+        # Inline reads are full duplex: use one row to avoid overlapping time bubbles.
         return AnalyzerFrame(display_type(packet), words[0].start_time, words[-1].end_time, visible)

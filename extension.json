@@ -1,6 +1,6 @@
 {
   "name": "TCS & PROG SPI",
-  "version": "1.0.4",
+  "version": "1.0.6",
   "apiVersion": "1.0.0",
   "author": "cnbright",
   "description": "ICNT9268S TCS/PROG decoder with CRC validation, response correlation and Die selection",

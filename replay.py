@@ -17,6 +17,10 @@ def csv_frames(path):
         if not required.issubset(reader.fieldnames or []):
             raise ValueError('Expected Saleae SPI data-table CSV columns: ' + ', '.join(sorted(required)))
         for line, row in enumerate(reader, 2):
+            # Combined exports include our existing HLA rows between SPI words.
+            # Replay only the underlying input, never feed summaries back in.
+            if row.get('name') == 'TCS & PROG':
+                continue
             data = {}
             for key in ('mosi', 'miso'):
                 text = row[key].strip()
